@@ -1,0 +1,41 @@
+HELP.md
+target/
+.mvn/wrapper/maven-wrapper.jar
+!**/src/main/**/target/
+!**/src/test/**/target/
+
+### STS ###
+.apt_generated
+.classpath
+.factorypath
+.project
+.settings
+.springBeans
+.sts4-cache
+
+### IntelliJ IDEA ###
+.idea
+*.iws
+*.iml
+*.ipr
+
+### NetBeans ###
+/nbproject/private/
+/nbbuild/
+/dist/
+/nbdist/
+/.nb-gradle/
+build/
+!**/src/main/**/build/
+!**/src/test/**/build/
+
+### VS Code ###
+.vscode/
+
+S
+/BE_ChargeHub/AI_IMPROVEMENTS_SUMMARY.md
+/BE_ChargeHub/AI_QUICK_START_GUIDE.md
+/FE_ChargeHub/AI_IMPROVEMENTS_SUMMARY.md
+/FE_ChargeHub/AI_QUICK_START_GUIDE.md
+/BE_ChargeHub/CHANGES_SUMMARY.md
+/BE_ChargeHub/IMPLEMENTATION_SUMMARY.md
