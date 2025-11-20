@@ -42,4 +42,25 @@ public interface FeeCalculationService {
      * Tính tổng số tiền phí
      */
     BigDecimal calculateTotalFees(List<Fee> fees);
+
+    /**
+     * Tính phí PARKING (phí đỗ xe sau khi hoàn thành sạc)
+     * Công thức: baseRate * minutes * (1 + 0.5 * floor(hours))
+     * - baseRate: 500 VND/phút
+     * - Mỗi giờ tăng thêm 50% phí
+     * - Phí tối thiểu: 10,000 VND
+     *
+     * @param parkedMinutes Số phút đỗ xe (sau khi trừ 15 phút grace period)
+     * @return Phí đỗ xe tính bằng VND
+     */
+    double calculateParkingFee(long parkedMinutes);
+
+    /**
+     * Tạo và lưu parking fee cho session
+     *
+     * @param session Session đỗ xe
+     * @param chargeableMinutes Số phút tính phí (đã trừ grace period)
+     * @return Fee entity đã được save, hoặc null nếu không có phí
+     */
+    Fee createParkingFee(Session session, long chargeableMinutes);
 }

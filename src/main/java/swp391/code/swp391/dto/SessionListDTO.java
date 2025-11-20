@@ -27,8 +27,12 @@ public class SessionListDTO {
     private LocalDateTime endTime;
     private Double powerConsumed; // kWh đã sạc
     private Double baseCost; // Tiền cơ bản
-    private String status; // CHARGING, COMPLETED, OVERTIME
-    private Boolean isOvertime; // Có quá giờ không
-    private Long overtimeMinutes; // Số phút quá giờ
+    private String status; // CHARGING, PARKING, COMPLETED
+
+    @Deprecated // Replaced by parking fee system
+    private Boolean isOvertime; // Deprecated - không còn track overtime
+
+    @Deprecated // Replaced by parking fee system
+    private Long overtimeMinutes; // Deprecated - thay thế bằng parking minutes
 }
 

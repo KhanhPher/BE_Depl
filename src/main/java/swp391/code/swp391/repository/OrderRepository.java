@@ -4,8 +4,10 @@ import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 import org.springframework.stereotype.Repository;
+import swp391.code.swp391.entity.ChargingPoint;
 import swp391.code.swp391.entity.Order;
 import swp391.code.swp391.entity.User;
+import swp391.code.swp391.entity.Order.Status;
 
 import java.time.LocalDateTime;
 import java.util.List;
@@ -127,9 +129,17 @@ public interface OrderRepository extends JpaRepository<Order, Long> {
             @Param("endTime") LocalDateTime endTime
     );
 
-
-
-    int countActiveOrdersByUser(User user);
+    /**
+     * Đếm số lượng orders active/upcoming của user
+     * Chỉ đếm orders có status BOOKED hoặc CHARGING và endTime > currentTime (upcoming)
+     */
+    @Query("""
+        SELECT COUNT(o) FROM Order o 
+        WHERE o.user.userId = :userId
+        AND o.status IN ('BOOKED', 'CHARGING')
+        AND o.endTime > :currentTime
+        """)
+    int countActiveOrdersByUser(@Param("userId") Long userId, @Param("currentTime") LocalDateTime currentTime);
 
 
     @Query("""
@@ -200,5 +210,7 @@ public interface OrderRepository extends JpaRepository<Order, Long> {
             @Param("stationId") Long stationId,
             @Param("fromTime") LocalDateTime fromTime
     );
+
+    List<Order> findByChargingPointAndStatusIn(ChargingPoint chargingPoint, List<Status> statuses);
 }
 

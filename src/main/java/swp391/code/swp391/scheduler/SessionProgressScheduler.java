@@ -84,16 +84,30 @@ public class SessionProgressScheduler {
             ? estimatedTotalMinutes - minutesElapsed
             : 0L;
 
+        // Calculate progress percentage
+        double startBattery = order.getStartedBattery();
+        double targetBattery = order.getExpectedBattery();
+        double progressPercentage = 0.0;
+        if (targetBattery > startBattery) {
+            progressPercentage = ((currentBattery - startBattery) / (targetBattery - startBattery)) * 100.0;
+            if (progressPercentage > 100) progressPercentage = 100.0;
+            if (progressPercentage < 0) progressPercentage = 0.0;
+        }
+
         // Build DTO
         SessionProgressDTO dto = new SessionProgressDTO(
-            currentBattery,
-            powerConsumed,
-            cost,
-            secondsElapsed, // elapsed seconds
-            minutesElapsed, // elapsed minutes
-            remainingMinutes,
-            session.getStartTime(),
-            now
+            startBattery,           // startBattery
+            currentBattery,         // currentBattery
+            targetBattery,          // targetBattery
+            progressPercentage,     // progressPercentage
+            powerConsumed,          // powerConsumed
+            cost,                   // cost
+            secondsElapsed,         // elapsedSeconds
+            minutesElapsed,         // elapsedMinutes
+            remainingMinutes,       // estimatedRemainingMinutes
+            session.getStartTime(), // startTime
+            now,                    // currentTime
+            session.getStatus().name() // status
         );
 
         // Push via WebSocket

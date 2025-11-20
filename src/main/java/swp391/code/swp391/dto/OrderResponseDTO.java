@@ -49,6 +49,10 @@ public class OrderResponseDTO {
     // Trạng thái
     private String status;
 
+    // Trạng thái session (nếu có) - để FE biết session đang CHARGING/PARKING/COMPLETED
+    private String sessionStatus;
+    private Long sessionId; // ID của session (nếu có)
+
     // Thời gian tạo đơn
     private LocalDateTime createdAt;
 }

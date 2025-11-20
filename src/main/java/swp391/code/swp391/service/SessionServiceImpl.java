@@ -2,6 +2,7 @@ package swp391.code.swp391.service;
 
 import jakarta.transaction.Transactional;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import swp391.code.swp391.dto.SessionProgressDTO;
 import swp391.code.swp391.dto.SessionDTO;
@@ -13,6 +14,7 @@ import java.time.temporal.ChronoUnit;
 import java.util.List;
 import java.util.stream.Collectors;
 
+@Slf4j
 @Service
 @RequiredArgsConstructor
 public class SessionServiceImpl implements SessionService {
@@ -24,6 +26,7 @@ public class SessionServiceImpl implements SessionService {
     private final UserRepository userRepository;
     private final NotificationService notificationService;
     private final FeeRepository feeRepository;
+    private final FeeCalculationService feeCalculationService;
     // private final SessionWebSocketService sessionWebSocketService;
 
     // Khoảng cách tối đa cho phép (tính bằng mét)
@@ -157,15 +160,22 @@ public class SessionServiceImpl implements SessionService {
         // Push initial session progress via WebSocket (0 power, 0 cost)
         try {
             long estimatedTotalMinutes = expectedMinutes(vehicle, order.getExpectedBattery());
+            double startBattery = order.getStartedBattery();
+            double targetBattery = order.getExpectedBattery();
+
             SessionProgressDTO dto = new SessionProgressDTO(
-                order.getStartedBattery(), // current battery = started battery
-                0.0, // power consumed
-                0.0, // cost
-                0L, // elapsed seconds
-                0L, // elapsed minutes
-                estimatedTotalMinutes, // estimated remaining
-                startTime, // start time
-                startTime // current time (just started)
+                startBattery,       // startBattery
+                startBattery,       // currentBattery (same as start initially)
+                targetBattery,      // targetBattery
+                0.0,                // progressPercentage (0% at start)
+                0.0,                // powerConsumed
+                0.0,                // cost
+                0L,                 // elapsedSeconds
+                0L,                 // elapsedMinutes
+                estimatedTotalMinutes, // estimatedRemainingMinutes
+                startTime,          // startTime
+                startTime,          // currentTime (just started)
+                "CHARGING"          // status
             );
             // sessionWebSocketService.sendSessionProgressToUser(order.getUser(), dto);
         } catch (Exception ignored) {}
@@ -187,8 +197,10 @@ public class SessionServiceImpl implements SessionService {
             throw new RuntimeException("Not authorized to monitor this session");
         }
 
-        if (session.getStatus() != Session.SessionStatus.CHARGING) {
-            throw new RuntimeException("Session not active");
+        // Cho phép monitor cả CHARGING và PARKING (đã đạt target, đang đỗ xe)
+        if (session.getStatus() != Session.SessionStatus.CHARGING &&
+            session.getStatus() != Session.SessionStatus.PARKING) {
+            throw new RuntimeException("Session not active or completed");
         }
 
         ConnectorType connectorType = session.getOrder().getChargingPoint().getConnectorType();
@@ -199,8 +211,13 @@ public class SessionServiceImpl implements SessionService {
         double power = connectorType.getPowerOutput(); // kW
         LocalDateTime now = LocalDateTime.now();
         
+        // Nếu session đã dừng (PARKING), sử dụng endTime thay vì now
+        LocalDateTime effectiveEndTime = (session.getStatus() == Session.SessionStatus.PARKING && session.getEndTime() != null)
+            ? session.getEndTime()
+            : now;
+
         // Tính toán chính xác theo giây thay vì phút để tránh làm tròn
-        long secondsElapsed = ChronoUnit.SECONDS.between(session.getStartTime(), now);
+        long secondsElapsed = ChronoUnit.SECONDS.between(session.getStartTime(), effectiveEndTime);
         long minutesElapsed = secondsElapsed / 60; // Tính phút từ giây
 
         // Tính powerConsumed chính xác từ giây
@@ -210,40 +227,104 @@ public class SessionServiceImpl implements SessionService {
         double priceFactor = 1.0;
         double discount = 0.0;
         double cost = powerConsumed * basePrice * priceFactor * (1 - discount);
-        //===============================================================
-        session.setPowerConsumed(powerConsumed);
-        session.setBaseCost(cost);
 
-        // Kiểm tra nếu đạt expectedBattery
-        double currentBattery = calculateBatteryPercentage(vehicle, powerConsumed) + session.getOrder().getStartedBattery();
-        if (currentBattery >= session.getOrder().getExpectedBattery()) {
-            if (currentBattery > 100) currentBattery = 100.0; // Chỉnh lại nếu vượt
-            // Gui thong bao o day
+        // Chỉ cập nhật nếu đang CHARGING
+        if (session.getStatus() == Session.SessionStatus.CHARGING) {
+            session.setPowerConsumed(powerConsumed);
+            session.setBaseCost(cost);
 
-            // Nếu tiếp tục sau đầy pin, áp phạt (giả sử check sau)
-            if (minutesElapsed > expectedMinutes(vehicle, session.getOrder().getExpectedBattery())) {
-                applyPenalty(session.getOrder(), Fee.Type.CHARGING);
+            // Kiểm tra nếu đạt expectedBattery
+            double currentBattery = calculateBatteryPercentage(vehicle, powerConsumed) + session.getOrder().getStartedBattery();
+
+            log.info("Session {} - Battery check: current={}%, target={}%, powerConsumed={} kWh",
+                     sessionId, String.format("%.2f", currentBattery),
+                     String.format("%.2f", session.getOrder().getExpectedBattery()),
+                     String.format("%.4f", powerConsumed));
+
+            if (currentBattery >= session.getOrder().getExpectedBattery()) {
+                if (currentBattery > 100) currentBattery = 100.0; // Chỉnh lại nếu vượt
+
+                log.info("TARGET REACHED - Session {} transitioning to PARKING (current={}%, target={}%)",
+                         sessionId, String.format("%.2f", currentBattery),
+                         String.format("%.2f", session.getOrder().getExpectedBattery()));
+
+                try {
+                    // TỰ ĐỘNG DỪNG SẠC VÀ CHUYỂN SANG PARKING KHI ĐẠT TARGET
+                    session.setEndTime(now);
+                    session.setStatus(Session.SessionStatus.PARKING);
+                    session.setParkingStartTime(now); // Bắt đầu tính grace period 15 phút
+                    session.setPowerConsumed(powerConsumed);
+                    session.setBaseCost(cost);
+
+                    // Cập nhật order status
+                    Order order = session.getOrder();
+                    order.setStatus(Order.Status.COMPLETED);
+                    Order savedOrder = orderRepository.save(order);
+
+                    log.info("Order {} saved with status: {}", savedOrder.getOrderId(), savedOrder.getStatus());
+
+                    // Gửi thông báo lần đầu khi đạt target
+                    if (!session.getTargetReachedNotificationSent()) {
+                        notificationService.createBookingOrderNotification(order.getOrderId(),
+                            NotificationServiceImpl.NotificationEvent.SESSION_COMPLETE,
+                            "Đã sạc đến mức mong muốn. Vui lòng xác nhận rời trạm trong vòng 15 phút để tránh phí đỗ xe");
+                        session.setTargetReachedNotificationSent(true);
+                    }
+
+                    Session savedSession = sessionRepository.save(session);
+
+                    log.info("Session {} saved with status: {} (parking started at: {})",
+                             savedSession.getSessionId(),
+                             savedSession.getStatus(),
+                             savedSession.getParkingStartTime());
+
+                    // Verify thực sự đã save vào DB
+                    Order verifiedOrder = orderRepository.findById(order.getOrderId()).orElse(null);
+                    if (verifiedOrder != null && verifiedOrder.getStatus() != Order.Status.COMPLETED) {
+                        log.error("CRITICAL: Order {} NOT COMPLETED in DB! Status is: {}",
+                                  order.getOrderId(), verifiedOrder.getStatus());
+                    }
+
+                } catch (Exception e) {
+                    log.error("Failed to transition session {} to PARKING: {}",
+                              sessionId, e.getMessage(), e);
+                    throw e;
+                }
+            } else {
+                sessionRepository.save(session); // Cập nhật progress
             }
-        } else {
-            sessionRepository.save(session); // Cập nhật progress
         }
 
-        // Trả về DTO
-        long estimatedTotalMinutes = expectedMinutes(vehicle, session.getOrder().getExpectedBattery());
+        // Trả về DTO với dữ liệu hiện tại
+        double startBattery = session.getOrder().getStartedBattery();
+        double targetBattery = session.getOrder().getExpectedBattery();
+        double currentBattery = calculateBatteryPercentage(vehicle, powerConsumed) + startBattery;
+        if (currentBattery > 100) currentBattery = 100.0;
+
+        // Calculate progress percentage: (current - start) / (target - start) * 100
+        double progressPercentage = 0.0;
+        if (targetBattery > startBattery) {
+            progressPercentage = ((currentBattery - startBattery) / (targetBattery - startBattery)) * 100.0;
+            progressPercentage = Math.min(100.0, Math.max(0.0, progressPercentage)); // Clamp 0-100
+        }
+
+        long estimatedTotalMinutes = expectedMinutes(vehicle, targetBattery);
         long remainingMinutes = estimatedTotalMinutes > minutesElapsed ? estimatedTotalMinutes - minutesElapsed : 0L;
 
-        SessionProgressDTO dto = new SessionProgressDTO(
-            currentBattery,
-            powerConsumed,
-            cost,
-            secondsElapsed, // elapsed seconds (CHÍNH XÁC)
-            minutesElapsed, // elapsed minutes (để backward compatibility)
-            remainingMinutes, // estimated remaining
-            session.getStartTime(), // start time
-            now // current time
+        return new SessionProgressDTO(
+            startBattery,        // startBattery
+            currentBattery,      // currentBattery
+            targetBattery,       // targetBattery
+            progressPercentage,  // progressPercentage
+            powerConsumed,       // powerConsumed
+            cost,                // cost
+            secondsElapsed,      // elapsedSeconds
+            minutesElapsed,      // elapsedMinutes (backward compatibility)
+            remainingMinutes,    // estimatedRemainingMinutes
+            session.getStartTime(), // startTime
+            effectiveEndTime,    // currentTime
+            session.getStatus().name() // status (CHARGING or PARKING)
         );
-
-        return dto;
     }
 
     @Override
@@ -256,78 +337,71 @@ public class SessionServiceImpl implements SessionService {
             throw new RuntimeException("Not authorized to end this session");
         }
 
-        if (session.getStatus() != Session.SessionStatus.CHARGING) {
-            throw new RuntimeException("Session not active");
+        // Cho phép end session từ cả CHARGING và PARKING
+        if (session.getStatus() != Session.SessionStatus.CHARGING &&
+            session.getStatus() != Session.SessionStatus.PARKING) {
+            throw new RuntimeException("Session cannot be ended from current status");
         }
 
-        ConnectorType connectorType = session.getOrder().getChargingPoint().getConnectorType();
-        Vehicle vehicle = vehicleRepository.findById(session.getOrder().getVehicle().getId())
-                .orElseThrow(() -> new RuntimeException("Vehicle not found for session"));
+        // ===== CASE 1: Nếu đang CHARGING, chuyển sang PARKING trước =====
+        if (session.getStatus() == Session.SessionStatus.CHARGING) {
+            transitionSessionToParking(session, "Dừng thủ công bởi người dùng");
+            // Sau khi chuyển sang PARKING, return sessionId
+            // User sẽ phải gọi endSession lần nữa để xác nhận rời đi
+            return session.getSessionId();
+        }
+
+        // ===== CASE 2: Nếu đang PARKING, xử lý phí parking và hoàn thành session =====
 
         LocalDateTime now = LocalDateTime.now();
-        double power = connectorType.getPowerOutput();
-        
-        // Tính toán chính xác theo giây thay vì phút để tránh làm tròn
-        long secondsElapsed = ChronoUnit.SECONDS.between(session.getStartTime(), now);
-        long minutesElapsed = secondsElapsed / 60; // Tính phút từ giây
-        double powerConsumed = power * (secondsElapsed / 3600.0); // kWh = kW * (seconds / 3600)
 
-        // Calculate cost
-        double basePrice = connectorType.getPricePerKWh();
-        double priceFactor = 1.0;
-        double discount = 0.0;
-        double cost = powerConsumed * basePrice * priceFactor * (1 - discount);
+        // XỬ LÝ PHÍ PARKING (nếu đang ở trạng thái PARKING)
+        if (session.getStatus() == Session.SessionStatus.PARKING && session.getParkingStartTime() != null) {
+            // Tính thời gian từ khi bắt đầu parking đến khi user xác nhận rời đi
+            long minutesSinceParkingStart = ChronoUnit.MINUTES.between(session.getParkingStartTime(), now);
 
-        // Update session - KHÔNG hoàn tất ngay, chuyển sang chờ staff xác nhận
-        session.setBaseCost(cost);
-        session.setPowerConsumed(powerConsumed);
-        session.setEndTime(now);
-        session.setStatus(Session.SessionStatus.WAITING_STAFF_DECISION);
+            // Nếu quá 15 phút grace period → tính phí parking
+            if (minutesSinceParkingStart > 15) {
+                long chargeableMinutes = minutesSinceParkingStart - 15; // Trừ đi 15 phút grace
+
+                // Sử dụng FeeCalculationService để tạo parking fee
+                Fee fee = feeCalculationService.createParkingFee(session, chargeableMinutes);
+
+                if (fee != null) {
+                    // Gửi notification về phí đỗ xe
+                    notificationService.createPenaltyNotification(session.getOrder().getOrderId(),
+                            NotificationServiceImpl.PenaltyEvent.PARKING_PENALTY,
+                            fee.getAmount(),
+                            String.format("Đỗ xe %d phút sau grace period", chargeableMinutes));
+                }
+            }
+            // Nếu <= 15 phút: không tính phí, user rời đi đúng thời gian
+        }
+
+        // Hoàn thành session
+        session.setStatus(Session.SessionStatus.COMPLETED);
 
         // Update order status
         Order order = session.getOrder();
         order.setStatus(Order.Status.COMPLETED);
         orderRepository.save(order);
 
-        // KHÔNG giải phóng charging point - chờ staff xác nhận
-        // ChargingPoint vẫn ở trạng thái OCCUPIED
-
-        // Calculate final battery percentage
-        double finalBattery = calculateBatteryPercentage(vehicle, powerConsumed) + session.getOrder().getStartedBattery();
-        if (finalBattery > 100) {
-            finalBattery = 100.0;
-        }
-
-        // Check for overtime penalty
-        if (minutesElapsed > expectedMinutes(vehicle, session.getOrder().getExpectedBattery())) {
-            applyPenalty(order, Fee.Type.CHARGING);
+        // Giải phóng charging point
+        ChargingPoint chargingPoint = order.getChargingPoint();
+        if (chargingPoint != null) {
+            chargingPoint.setStatus(ChargingPoint.ChargingPointStatus.AVAILABLE);
+            chargingPointRepository.save(chargingPoint);
         }
 
         // Save session
         session = sessionRepository.save(session);
 
-        // Gửi notification cho USER để nhắc rời trạm
-        notificationService.createBookingOrderNotification(order.getOrderId(),
-            NotificationServiceImpl.NotificationEvent.SESSION_COMPLETE,
-            "Vui lòng rời khỏi trạm sạc để tránh phí đỗ xe");
-
-        // Push final progress via WebSocket
-        try {
-            double finalBatteryPercent = calculateBatteryPercentage(vehicle, powerConsumed) + session.getOrder().getStartedBattery();
-            if (finalBatteryPercent > 100) finalBatteryPercent = 100.0;
-
-            SessionProgressDTO finalDto = new SessionProgressDTO(
-                finalBatteryPercent,
-                powerConsumed,
-                session.getBaseCost(),
-                secondsElapsed, // elapsed seconds (use variable from above)
-                minutesElapsed, // elapsed minutes
-                0L, // remaining = 0 (completed)
-                session.getStartTime(), // start time
-                now // current time
-            );
-            // sessionWebSocketService.sendSessionProgressToUser(order.getUser(), finalDto);
-        } catch (Exception ignored) {}
+        // Gửi notification xác nhận hoàn thành (nếu chưa gửi)
+        if (!session.getTargetReachedNotificationSent()) {
+            notificationService.createBookingOrderNotification(order.getOrderId(),
+                NotificationServiceImpl.NotificationEvent.SESSION_COMPLETE,
+                "Cảm ơn bạn đã sử dụng dịch vụ!");
+        }
 
         return session.getSessionId();
     }
@@ -351,8 +425,8 @@ public class SessionServiceImpl implements SessionService {
             case CANCEL:
                 penaltyEvent = NotificationServiceImpl.PenaltyEvent.CANCEL_PENALTY;
                 break;
-            case CHARGING:
-                penaltyEvent = NotificationServiceImpl.PenaltyEvent.OVERTIME_PENALTY;
+            case PARKING:
+                penaltyEvent = NotificationServiceImpl.PenaltyEvent.PARKING_PENALTY;
                 break;
             default:
                 penaltyEvent = NotificationServiceImpl.PenaltyEvent.NO_SHOW_PENALTY;
@@ -455,32 +529,47 @@ public class SessionServiceImpl implements SessionService {
         Session session = sessionRepository.findById(sessionId)
                 .orElseThrow(() -> new RuntimeException("Session not found"));
 
-        if (session.getStatus() != Session.SessionStatus.CHARGING) {
+        if (session.getStatus() != Session.SessionStatus.CHARGING &&
+            session.getStatus() != Session.SessionStatus.PARKING) {
             throw new RuntimeException("Session not active");
         }
 
-        ConnectorType connectorType = session.getOrder().getChargingPoint().getConnectorType();
-        Vehicle vehicle = vehicleRepository.findById(session.getOrder().getVehicle().getId())
-                .orElseThrow(() -> new RuntimeException("Vehicle not found for session"));
+        // ===== CASE 1: Nếu đang CHARGING, chuyển sang PARKING =====
+        if (session.getStatus() == Session.SessionStatus.CHARGING) {
+            transitionSessionToParking(session, "Dừng bởi staff/operator");
+            return session.getSessionId();
+        }
 
+        // ===== CASE 2: Nếu đang PARKING, force complete luôn =====
         LocalDateTime now = LocalDateTime.now();
-        double power = connectorType.getPowerOutput();
-        
-        // Tính toán chính xác theo giây thay vì phút để tránh làm tròn
-        long secondsElapsed = ChronoUnit.SECONDS.between(session.getStartTime(), now);
-        long minutesElapsed = secondsElapsed / 60; // Tính phút từ giây
-        double powerConsumed = power * (secondsElapsed / 3600.0); // kWh = kW * (seconds / 3600)
 
-        // Calculate cost
-        double basePrice = connectorType.getPricePerKWh();
-        double priceFactor = 1.0;
-        double discount = 0.0;
-        double cost = powerConsumed * basePrice * priceFactor * (1 - discount);
+        // XỬ LÝ PHÍ PARKING (nếu đang ở trạng thái PARKING)
+        if (session.getStatus() == Session.SessionStatus.PARKING && session.getParkingStartTime() != null) {
+            // Tính thời gian từ khi bắt đầu parking đến khi staff force complete
+            long minutesSinceParkingStart = ChronoUnit.MINUTES.between(session.getParkingStartTime(), now);
 
-        // Update session
-        session.setBaseCost(cost);
-        session.setPowerConsumed(powerConsumed);
-        session.setEndTime(now);
+            // Nếu quá 15 phút grace period → tính phí parking
+            if (minutesSinceParkingStart > 15) {
+                long chargeableMinutes = minutesSinceParkingStart - 15; // Trừ đi 15 phút grace
+
+                // Sử dụng FeeCalculationService để tạo parking fee
+                Fee fee = feeCalculationService.createParkingFee(session, chargeableMinutes);
+
+                if (fee != null) {
+                    // Override description cho staff force complete
+                    fee.setDescription(String.format("Phí đỗ xe %d phút (staff force complete)", chargeableMinutes));
+                    feeRepository.save(fee);
+
+                    // Gửi notification về phí đỗ xe
+                    notificationService.createPenaltyNotification(session.getOrder().getOrderId(),
+                            NotificationServiceImpl.PenaltyEvent.PARKING_PENALTY,
+                            fee.getAmount(),
+                            String.format("Staff force complete - Đỗ xe %d phút sau grace period", chargeableMinutes));
+                }
+            }
+        }
+
+        // Hoàn thành session
         session.setStatus(Session.SessionStatus.COMPLETED);
 
         // Update order status
@@ -495,17 +584,6 @@ public class SessionServiceImpl implements SessionService {
             chargingPointRepository.save(chargingPoint);
         }
 
-        // Calculate final battery percentage
-        double finalBattery = calculateBatteryPercentage(vehicle, powerConsumed) + session.getOrder().getStartedBattery();
-        if (finalBattery > 100) {
-            finalBattery = 100.0;
-        }
-
-        // Check for overtime penalty
-        if (minutesElapsed > expectedMinutes(vehicle, session.getOrder().getExpectedBattery())) {
-            applyPenalty(order, Fee.Type.CHARGING);
-        }
-
         // Save session
         session = sessionRepository.save(session);
 
@@ -513,138 +591,81 @@ public class SessionServiceImpl implements SessionService {
         notificationService.createBookingOrderNotification(order.getOrderId(),
                 NotificationServiceImpl.NotificationEvent.SESSION_COMPLETE, null);
 
-        // Push final progress via WebSocket
-        try {
-            double finalBatteryPercent = calculateBatteryPercentage(vehicle, powerConsumed) + session.getOrder().getStartedBattery();
-            if (finalBatteryPercent > 100) finalBatteryPercent = 100.0;
-
-            SessionProgressDTO finalDto = new SessionProgressDTO(
-                finalBatteryPercent,
-                powerConsumed,
-                session.getBaseCost(),
-                secondsElapsed, // elapsed seconds (use variable from above)
-                minutesElapsed, // elapsed minutes
-                0L, // remaining = 0 (force completed)
-                session.getStartTime(), // start time
-                now // current time (end time)
-            );
-            // sessionWebSocketService.sendSessionProgressToUser(order.getUser(), finalDto);
-        } catch (Exception ignored) {}
 
         return session.getSessionId();
     }
 
     /**
-     * Staff xác nhận xe vẫn đậu tại trạm (slot vẫn bị chiếm dụng, bắt đầu tính phí đỗ xe)
+     * DEPRECATED: Staff-related methods are no longer used in the new self-service flow
+     * User now confirms departure themselves via endSession()
      */
+
+    /*
     @Transactional
     public Long staffMarkStillParked(Long sessionId, Long staffId) {
-        Session session = sessionRepository.findById(sessionId)
-                .orElseThrow(() -> new RuntimeException("Session not found"));
-
-        if (session.getStatus() != Session.SessionStatus.WAITING_STAFF_DECISION) {
-            throw new RuntimeException("Session not awaiting staff decision");
-        }
-
-        // Chuyển session sang trạng thái STILL_PARKED và ghi nhận thời điểm bắt đầu tính phí
-        session.setStatus(Session.SessionStatus.STILL_PARKED);
-        // Grace period 15 phút sau khi kết thúc phiên sạc: không tính phí trong khoảng này
-        LocalDateTime graceStart = (session.getEndTime() != null)
-                ? session.getEndTime().plusMinutes(15)
-                : LocalDateTime.now().plusMinutes(15);
-        session.setParkingStartTime(graceStart);
-        sessionRepository.save(session);
-
-        // Charging point vẫn giữ trạng thái OCCUPIED (không thay đổi)
-
-        // Gửi notification cho người dùng
-        notificationService.createBookingOrderNotification(session.getOrder().getOrderId(),
-                NotificationServiceImpl.NotificationEvent.SESSION_STILL_PARKED, null);
-
-        return session.getSessionId();
+        // No longer used - parking status is managed automatically
+        throw new RuntimeException("This method is deprecated. Use self-service flow.");
     }
 
-    /**
-     * Staff xác nhận xe đã rời trạm
-     * Nếu trước đó đã mark STILL_PARKED thì tính phí đỗ xe
-     */
     @Transactional
     public Long staffMarkLeft(Long sessionId, Long staffId) {
-        Session session = sessionRepository.findById(sessionId)
-                .orElseThrow(() -> new RuntimeException("Session not found"));
+        // No longer used - user confirms departure via endSession()
+        throw new RuntimeException("This method is deprecated. Use endSession() instead.");
+    }
+    */
 
-        if (session.getStatus() != Session.SessionStatus.WAITING_STAFF_DECISION
-                && session.getStatus() != Session.SessionStatus.STILL_PARKED) {
-            throw new RuntimeException("Session not awaiting staff decision or not in parked state");
+    /**
+     * Helper method: Chuyển session sang trạng thái PARKING
+     * Được gọi từ cả manual stop, auto-stop và force stop
+     * @param session Session cần chuyển sang PARKING
+     * @param stopReason Lý do dừng (để ghi log/notification)
+     */
+    private void transitionSessionToParking(Session session, String stopReason) {
+        LocalDateTime now = LocalDateTime.now();
+
+        // Nếu đã ở PARKING hoặc COMPLETED, bỏ qua
+        if (session.getStatus() == Session.SessionStatus.PARKING ||
+            session.getStatus() == Session.SessionStatus.COMPLETED) {
+            return;
         }
 
-        // Nếu xe vẫn đậu, tính phí đỗ xe từ parkingStartTime đến hiện tại
-        if (session.getStatus() == Session.SessionStatus.STILL_PARKED) {
-            LocalDateTime now = LocalDateTime.now();
-            LocalDateTime start = session.getParkingStartTime() != null ?
-                    session.getParkingStartTime() : session.getEndTime();
-            long parkedMinutes = Math.max(0L, ChronoUnit.MINUTES.between(start, now));
-
-            if (parkedMinutes > 0) {
-                double parkingAmount = calculateParkingFee(session, parkedMinutes);
-
-                // Tạo fee cho phí đỗ xe
-                Fee fee = new Fee();
-                fee.setOrder(session.getOrder());
-                fee.setSession(session);
-                fee.setType(Fee.Type.PARKING);
-                fee.setAmount(parkingAmount);
-                fee.setIsPaid(false);
-                fee.setCreatedAt(LocalDateTime.now());
-                fee.setDescription(String.format("Phí đỗ xe %d phút sau khi sạc xong", parkedMinutes));
-                feeRepository.save(fee);
-
-                // Gửi notification về phí đỗ xe
-                notificationService.createPenaltyNotification(session.getOrder().getOrderId(),
-                        NotificationServiceImpl.PenaltyEvent.PARKING_PENALTY,
-                        fee.getAmount(),
-                        String.format("Đỗ xe %d phút sau khi sạc xong", parkedMinutes));
-            }
+        // 1. Tính toán và cập nhật charging cost (nếu chưa có endTime)
+        if (session.getEndTime() == null) {
+            session.setEndTime(now);
         }
 
-        // Hoàn tất session và giải phóng charging point
-        session.setStatus(Session.SessionStatus.COMPLETED);
-        sessionRepository.save(session);
+        ConnectorType connectorType = session.getOrder().getChargingPoint().getConnectorType();
+        double power = connectorType.getPowerOutput();
+        long secondsElapsed = ChronoUnit.SECONDS.between(session.getStartTime(), session.getEndTime());
+        double powerConsumed = power * (secondsElapsed / 3600.0);
+        double basePrice = connectorType.getPricePerKWh();
+        double cost = powerConsumed * basePrice;
 
+        session.setPowerConsumed(powerConsumed);
+        session.setBaseCost(cost);
+
+        // 2. Chuyển sang PARKING và bắt đầu grace period 15 phút
+        session.setStatus(Session.SessionStatus.PARKING);
+        session.setParkingStartTime(now);
+
+        // 3. Cập nhật order status
         Order order = session.getOrder();
-        // Order đã được set COMPLETED trong endSession, giữ nguyên
         order.setStatus(Order.Status.COMPLETED);
         orderRepository.save(order);
 
-        ChargingPoint cp = order.getChargingPoint();
-        if (cp != null) {
-            cp.setStatus(ChargingPoint.ChargingPointStatus.AVAILABLE);
-            chargingPointRepository.save(cp);
+        // 4. Lưu session
+        sessionRepository.save(session);
+
+        // 5. Gửi notification cho user
+        String message = String.format("Phiên sạc đã dừng (%s). Vui lòng xác nhận rời trạm trong vòng 15 phút để tránh phí đỗ xe.", stopReason);
+        if (!session.getTargetReachedNotificationSent()) {
+            notificationService.createBookingOrderNotification(
+                order.getOrderId(),
+                NotificationServiceImpl.NotificationEvent.SESSION_COMPLETE,
+                message
+            );
+            session.setTargetReachedNotificationSent(true);
+            sessionRepository.save(session);
         }
-
-        // Gửi notification hoàn tất
-        notificationService.createBookingOrderNotification(order.getOrderId(),
-                NotificationServiceImpl.NotificationEvent.SESSION_COMPLETE, null);
-
-        return session.getSessionId();
-    }
-
-    /**
-     * Tính phí đỗ xe theo thời gian (tăng dần theo công thức)
-     * Công thức: baseRate * minutes * (1 + 0.5 * floor(hours))
-     * - baseRate: 500 VND/phút (có thể điều chỉnh)
-     * - Mỗi giờ tăng thêm 50% phí
-     * - Phí tối thiểu: 10,000 VND
-     */
-    private double calculateParkingFee(Session session, long parkedMinutes) {
-        if (parkedMinutes <= 0) return 0.0;
-
-        double baseRatePerMinute = 500.0; // 500 VND/phút
-        double hours = Math.floor(parkedMinutes / 60.0);
-        double multiplier = 1.0 + (0.5 * hours); // +50% mỗi giờ
-        double amount = baseRatePerMinute * parkedMinutes * multiplier;
-
-        double minimum = 10000.0; // Phí tối thiểu 10,000 VND
-        return Math.max(amount, minimum);
     }
 }

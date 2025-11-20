@@ -4,9 +4,12 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 import swp391.code.swp391.entity.Session;
 import swp391.code.swp391.repository.SessionRepository;
 import swp391.code.swp391.service.EmailService;
+import swp391.code.swp391.service.NotificationService;
+import swp391.code.swp391.service.NotificationServiceImpl;
 
 import java.time.Duration;
 import java.time.LocalDateTime;
@@ -22,15 +25,84 @@ public class ParkingScheduler {
 
     private final SessionRepository sessionRepository;
     private final EmailService emailService;
+    private final NotificationService notificationService;
 
     // Track sessions đã gửi email nhắc nhở 1 giờ (tránh gửi trùng)
     private final Set<Long> warnedSessionIds = new HashSet<>();
 
+    // Track sessions đã gửi reminder sau 15 phút (tránh gửi trùng)
+    private final Set<Long> reminded15MinSessionIds = new HashSet<>();
+
     /**
-     * Mỗi 5 phút: kiểm tra các session STILL_PARKED quá 1 giờ kể từ khi kết thúc phiên sạc.
+     * Mỗi 1 phút: Gửi reminder cho user đang ở trạng thái PARKING quá 15 phút
+     * để nhắc họ xác nhận rời đi, nếu không sẽ bắt đầu tính phí từ khi họ confirm
+     */
+    @Scheduled(fixedRate = 1000 * 60) // Chạy mỗi 1 phút
+    public void sendParkingReminderAfter15Minutes() {
+        try {
+            LocalDateTime now = LocalDateTime.now();
+            List<Session> parkingSessions = sessionRepository.findByStatus(Session.SessionStatus.PARKING);
+
+            int remindedCount = 0;
+
+            for (Session session : parkingSessions) {
+                if (session.getParkingStartTime() == null) continue;
+                if (reminded15MinSessionIds.contains(session.getSessionId())) continue;
+
+                // Kiểm tra đã qua 15 phút chưa
+                long minutesSinceParking = Duration.between(session.getParkingStartTime(), now).toMinutes();
+
+                if (minutesSinceParking >= 15) {
+                    try {
+                        // Gửi notification nhắc nhở
+                        notificationService.createBookingOrderNotification(
+                            session.getOrder().getOrderId(),
+                            NotificationServiceImpl.NotificationEvent.SESSION_STILL_PARKED,
+                            "CẢNH BÁO: Đã hết grace period 15 phút! Vui lòng xác nhận rời trạm ngay. " +
+                            "Nếu không, phí đỗ xe sẽ được tính khi bạn xác nhận."
+                        );
+
+                        reminded15MinSessionIds.add(session.getSessionId());
+                        remindedCount++;
+
+                        log.info("Sent 15-min parking reminder for session {} (order {})",
+                            session.getSessionId(), session.getOrder().getOrderId());
+                    } catch (Exception e) {
+                        log.error("Failed to send 15-min reminder for session {}: {}",
+                            session.getSessionId(), e.getMessage());
+                    }
+                }
+            }
+
+            if (remindedCount > 0) {
+                log.info("Sent {} parking reminders (15-min grace period expired)", remindedCount);
+            }
+
+            // Cleanup reminded sessions that are no longer in PARKING status
+            cleanupReminded15MinSessions();
+
+        } catch (Exception e) {
+            log.error("Error in sendParkingReminderAfter15Minutes: {}", e.getMessage(), e);
+        }
+    }
+
+    private void cleanupReminded15MinSessions() {
+        try {
+            Set<Long> activeParkingIds = sessionRepository.findAll().stream()
+                    .filter(s -> s.getStatus() == Session.SessionStatus.PARKING)
+                    .map(Session::getSessionId)
+                    .collect(java.util.stream.Collectors.toSet());
+            reminded15MinSessionIds.retainAll(activeParkingIds);
+        } catch (Exception e) {
+            log.error("Error cleaning reminded 15-min session IDs: {}", e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Mỗi 5 phút: kiểm tra các session PARKING quá 1 giờ kể từ khi bắt đầu parking.
      * Điều kiện gửi mail:
-     *  - Session.status == STILL_PARKED
-     *  - now >= endTime + 60 phút (ưu tiên theo yêu cầu nghiệp vụ)
+     *  - Session.status == PARKING
+     *  - now >= parkingStartTime + 60 phút
      *  - Chưa từng gửi email cho session này (trong vòng đời app)
      */
     @Scheduled(fixedRate = 1000 * 60 * 5)
@@ -43,13 +115,13 @@ public class ParkingScheduler {
             long totalWarned = 0;
 
             for (Session s : sessions) {
-                if (s.getStatus() != Session.SessionStatus.STILL_PARKED) continue;
-                if (s.getEndTime() == null) continue;
+                if (s.getStatus() != Session.SessionStatus.PARKING) continue;
+                if (s.getParkingStartTime() == null) continue;
                 if (warnedSessionIds.contains(s.getSessionId())) continue; // tránh gửi trùng
 
                 totalChecked++;
 
-                LocalDateTime threshold = s.getEndTime().plusHours(1);
+                LocalDateTime threshold = s.getParkingStartTime().plusHours(1);
                 if (now.isBefore(threshold)) continue; // chưa đủ 1 giờ
 
                 try {
@@ -61,16 +133,16 @@ public class ParkingScheduler {
                     String stationName = order.getChargingPoint().getStation().getStationName();
                     String chargingPointName = order.getChargingPoint().getChargingPointName();
 
-                    long parkedMinutes = Math.max(0, Duration.between(s.getEndTime(), now).toMinutes());
+                    long parkedMinutes = Math.max(0, Duration.between(s.getParkingStartTime(), now).toMinutes());
                     DateTimeFormatter fmt = DateTimeFormatter.ofPattern("HH:mm dd/MM/yyyy");
-                    String endTimeStr = s.getEndTime().format(fmt);
+                    String parkingTimeStr = s.getParkingStartTime().format(fmt);
 
                     emailService.sendStillParkedAfterOneHourEmail(
                             toEmail,
                             userName,
                             stationName,
                             chargingPointName,
-                            endTimeStr,
+                            parkingTimeStr,
                             parkedMinutes
                     );
 
@@ -86,7 +158,7 @@ public class ParkingScheduler {
             if (totalChecked > 0)
                 log.info("ParkingScheduler: checked {} sessions, sent {} emails", totalChecked, totalWarned);
 
-            // Cleanup đã gửi cho những session không còn STILL_PARKED
+            // Cleanup đã gửi cho những session không còn PARKING
             cleanupWarnedSessionIds();
 
         } catch (Exception e) {
@@ -96,11 +168,11 @@ public class ParkingScheduler {
 
     private void cleanupWarnedSessionIds() {
         try {
-            Set<Long> activeStillParkedIds = sessionRepository.findAll().stream()
-                    .filter(s -> s.getStatus() == Session.SessionStatus.STILL_PARKED)
+            Set<Long> activeParkingIds = sessionRepository.findAll().stream()
+                    .filter(s -> s.getStatus() == Session.SessionStatus.PARKING)
                     .map(Session::getSessionId)
                     .collect(java.util.stream.Collectors.toSet());
-            warnedSessionIds.retainAll(activeStillParkedIds);
+            warnedSessionIds.retainAll(activeParkingIds);
         } catch (Exception e) {
             log.error("Error cleaning warned session IDs: {}", e.getMessage(), e);
         }

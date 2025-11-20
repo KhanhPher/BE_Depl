@@ -25,7 +25,8 @@ public class GeminiCacheConfig {
                 "gemini-responses",      // Cache cho câu trả lời
                 "station-suggestions",   // Cache cho gợi ý trạm
                 "market-trends",         // Cache cho xu hướng thị trường
-                "amenities"              // Cache cho tiện ích xung quanh
+                "amenities",             // Cache cho tiện ích xung quanh
+                "parking-monitor"        // Cache cho parking duration monitoring (TTL: 30s)
         );
 
         cacheManager.setCaffeine(Caffeine.newBuilder()

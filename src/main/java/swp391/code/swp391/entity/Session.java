@@ -35,6 +35,9 @@ public class Session {
 
     private LocalDateTime parkingStartTime; // Thời điểm bắt đầu tính phí đỗ xe
 
+    @Column(nullable = false)
+    private Boolean targetReachedNotificationSent = false; // Đã gửi thông báo đạt target battery chưa
+
     @OneToMany(mappedBy = "session", cascade = CascadeType.ALL)
     @ToString.Exclude
     private List<Fee> fees; //Các phí phát sinh
@@ -44,18 +47,17 @@ public class Session {
     private SessionStatus status = SessionStatus.CHARGING;
 
     public enum SessionStatus {
-        CHARGING,
-        WAITING_STAFF_DECISION, // Chờ staff xác nhận xe đã rời hay chưa
-        STILL_PARKED,           // Staff xác nhận xe vẫn đậu (đang tính phí)
-        COMPLETED,
-        OVERTIME
+        CHARGING,              // Đang sạc
+        PARKING,               // Đã dừng sạc, đang đỗ xe (có 15 phút grace period, user tự xác nhận rời đi)
+        COMPLETED              // Hoàn thành
     }
 
-    // Kiểm tra xem session có overtime không
-    public boolean isOvertime() {
-        if (endTime == null || order == null || order.getEndTime() == null) {
-            return false;
-        }
-        return endTime.isAfter(order.getEndTime());
+    // getTotalCost - Tính tổng chi phí bao gồm cả phí phát sinh
+    public Double getTotalCost() {
+        double totalFees = fees != null ?
+            fees.stream()
+                .mapToDouble(Fee::getAmount)
+                .sum() : 0.0;
+        return baseCost + totalFees;
     }
 }

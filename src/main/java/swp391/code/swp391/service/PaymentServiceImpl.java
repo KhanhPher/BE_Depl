@@ -17,6 +17,7 @@ import swp391.code.swp391.repository.*;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.LocalDateTime;
+import java.time.temporal.ChronoUnit;
 import java.util.List;
 import java.util.stream.Collectors;
 
@@ -25,14 +26,19 @@ import java.util.stream.Collectors;
 @Slf4j
 public class PaymentServiceImpl implements PaymentService {
 
-    // Thời gian sạc tối thiểu (phút) - có thể đổi thành @Value nếu cần config từ application.properties
-    private static final int MINIMUM_CHARGING_TIME_MINUTES = 10;
+    // Thời gian sạc tối thiểu (phút) - sạc < 30 phút sẽ tính như 30 phút
+    private static final int MINIMUM_CHARGING_TIME_MINUTES = 30;
+
+    // Phí sạc tối thiểu CỐ ĐỊNH sẽ được tính dựa trên 30 phút × giá điện
+    // Không cần constant MINIMUM_CHARGING_FEE vì sẽ tính động dựa trên basePrice
 
     private final SessionRepository sessionRepository;
     private final UserRepository userRepository;
     private final TransactionRepository transactionRepository;
     private final FeeRepository feeRepository;
     private final SubscriptionRepository subscriptionRepository;
+    private final OrderRepository orderRepository;
+    private final ChargingPointRepository chargingPointRepository;
     private final FeeCalculationService feeCalculationService;
     private final NotificationService notificationService;
     private final VNPayService vnPayService;
@@ -49,8 +55,10 @@ public class PaymentServiceImpl implements PaymentService {
         Session session = sessionRepository.findById(sessionId)
                 .orElseThrow(() -> new RuntimeException("Không tìm thấy phien sạc với ID: " + sessionId));
 
-        // Kiểm tra session đã hoàn thành chưa
-        if (session.getStatus() != Session.SessionStatus.COMPLETED) {
+        // Cho phép tính toán thanh toán khi session status = COMPLETED hoặc PARKING
+        // PARKING status nghĩa là đã hoàn thành sạc và đang đỗ xe, user có thể thanh toán
+        if (session.getStatus() != Session.SessionStatus.COMPLETED && 
+            session.getStatus() != Session.SessionStatus.PARKING) {
             throw new RuntimeException("Phiên sạc chưa hoàn thành, không thể thanh toán");
         }
 
@@ -61,15 +69,38 @@ public class PaymentServiceImpl implements PaymentService {
         BigDecimal baseCost = calculateBaseCost(session, user);
 
         // Bước 2: Tính tổng các khoản phí CHƯA THANH TOÁN
-        // ✅ CHỈ lấy fees có isPaid = false để tránh tính trùng
+        // CHỈ lấy fees có isPaid = false để tránh tính trùng
         List<Fee> unpaidFees = feeCalculationService.getUnpaidSessionFees(sessionId);
         BigDecimal totalFees = feeCalculationService.calculateTotalFees(unpaidFees);
 
-        // Tổng số tiền = baseCost + totalFees (CHƯA thanh toán)
-        BigDecimal totalAmount = baseCost.add(totalFees);
+        // Bước 3: TÍNH PARKING FEE NẾU SESSION ĐANG Ở PARKING VÀ CHƯA CÓ FEE
+        // Kiểm tra xem đã có parking fee chưa (có thể đã tạo khi gọi endSession())
+        boolean hasParkingFee = unpaidFees.stream()
+                .anyMatch(fee -> fee.getType() == Fee.Type.PARKING);
+        
+        BigDecimal parkingFee = BigDecimal.ZERO;
+        if (session.getStatus() == Session.SessionStatus.PARKING && 
+            session.getParkingStartTime() != null && 
+            !hasParkingFee) {
+            // Tính thời gian đỗ từ khi bắt đầu parking đến hiện tại
+            LocalDateTime now = LocalDateTime.now();
+            long totalParkingMinutes = ChronoUnit.MINUTES.between(session.getParkingStartTime(), now);
+            
+            // Nếu quá 15 phút grace period → tính phí parking
+            if (totalParkingMinutes > 15) {
+                long chargeableMinutes = totalParkingMinutes - 15; // Trừ đi 15 phút grace
+                double parkingFeeAmount = feeCalculationService.calculateParkingFee(chargeableMinutes);
+                parkingFee = BigDecimal.valueOf(parkingFeeAmount);
+                
+                log.info("Tính parking fee: {} phút chargeable = {} VND", chargeableMinutes, parkingFeeAmount);
+            }
+        }
 
-        log.info("Tính toán hoàn tất - Base Cost: {}, Unpaid Fees: {} (count: {}), Total Amount: {}",
-                baseCost, totalFees, unpaidFees.size(), totalAmount);
+        // Tổng số tiền = baseCost + totalFees (CHƯA thanh toán) + parkingFee (nếu có)
+        BigDecimal totalAmount = baseCost.add(totalFees).add(parkingFee);
+
+        log.info("Tính toán hoàn tất - Base Cost: {}, Unpaid Fees: {} (count: {}), Parking Fee: {}, Total Amount: {}",
+                baseCost, totalFees, unpaidFees.size(), parkingFee, totalAmount);
 
         return totalAmount.setScale(2, RoundingMode.HALF_UP);
     }
@@ -78,9 +109,14 @@ public class PaymentServiceImpl implements PaymentService {
      * Tính chi phí cơ bản của phiên sạc
      * Công thức: powerConsumed × basePrice × (1 - subscriptionDiscount)
      *
-     * ÁP DỤNG THỜI GIAN SẠC TỐI THIỂU:
-     * - Nếu thời gian sạc < minimum (mặc định 30 phút), tính theo minimum
-     * - Nếu thời gian sạc >= minimum, tính như bình thường
+     * ÁP DỤNG THỜI GIAN SẠC TỐI THIỂU 30 PHÚT:
+     * - Nếu thời gian sạc < 30 phút → tính tiền như sạc 30 phút (scale up power consumption)
+     * - Nếu thời gian sạc ≥ 30 phút → tính theo actual power consumed
+     *
+     * Logic: Tính billablePowerConsumed dựa trên tỷ lệ thời gian
+     * - actualTime = 10 phút, minimumTime = 30 phút
+     * - billablePower = actualPower × (30 / 10) = actualPower × 3
+     * - Như vậy sẽ charge tiền cho 30 phút
      */
     private BigDecimal calculateBaseCost(Session session, User user) {
         // 1. Lấy lượng điện tiêu thụ thực tế (kWh)
@@ -89,44 +125,60 @@ public class PaymentServiceImpl implements PaymentService {
         // 2. Lấy giá cơ bản từ ConnectorType (VND/kWh)
         BigDecimal basePrice = getBasePrice(session);
 
-        // 3. Áp dụng thời gian sạc tối thiểu
-        BigDecimal billablePowerConsumed = applyMinimumChargingTime(session, actualPowerConsumed);
-
-        // 4. Lấy giảm giá theo gói đăng ký (subscriptionDiscount)
+        // 3. Lấy giảm giá theo gói đăng ký
         BigDecimal subscriptionDiscount = getSubscriptionDiscount(user);
 
-        // Tính toán: billablePowerConsumed × basePrice × (1 - subscriptionDiscount)
+        // 4. Tính billable power consumption dựa trên minimum 30 phút
+        BigDecimal billablePowerConsumed = applyMinimumChargingTime(session, actualPowerConsumed);
+
+        // 5. Tính cost: billablePower × basePrice × (1 - discount)
         BigDecimal baseCost = billablePowerConsumed
                 .multiply(basePrice)
                 .multiply(BigDecimal.ONE.subtract(subscriptionDiscount))
                 .setScale(2, RoundingMode.HALF_UP);
+
         return baseCost;
     }
 
-    // java
+    /**
+     * Áp dụng thời gian sạc tối thiểu 30 phút
+     *
+     * Logic: Scale up power consumption nếu thời gian sạc < 30 phút
+     * - Nếu sạc 10 phút → scale up × 3 → tính như 30 phút
+     * - Nếu sạc 20 phút → scale up × 1.5 → tính như 30 phút
+     * - Nếu sạc 30 phút → không scale → tính thực tế
+     * - Nếu sạc 60 phút → không scale → tính thực tế
+     */
     private BigDecimal applyMinimumChargingTime(Session session, BigDecimal actualPowerConsumed) {
         if (session.getStartTime() == null || session.getEndTime() == null) {
             return actualPowerConsumed;
         }
 
-        long actualSeconds = java.time.Duration.between(session.getStartTime(), session.getEndTime()).getSeconds();
-        int minimumMinutes = MINIMUM_CHARGING_TIME_MINUTES;
-        long minimumSeconds = minimumMinutes * 60L;
+        long actualMinutes = java.time.Duration.between(
+            session.getStartTime(),
+            session.getEndTime()
+        ).toMinutes();
 
-        // Avoid division by zero and treat extremely short durations as 1s
-        actualSeconds = Math.max(1L, actualSeconds);
-
-        // If actual duration already >= minimum, bill actual consumption
-        if (actualSeconds >= minimumSeconds) {
+        // Nếu >= 30 phút → tính theo actual
+        if (actualMinutes >= MINIMUM_CHARGING_TIME_MINUTES) {
+            log.info("Session {} sạc {} phút >= {} phút minimum. Tính theo actual power: {} kWh",
+                     session.getSessionId(), actualMinutes, MINIMUM_CHARGING_TIME_MINUTES, actualPowerConsumed);
             return actualPowerConsumed;
         }
-        
-        // Tính billable power dựa trên tỷ lệ: (minimumSeconds / actualSeconds) × actualPowerConsumed
-        // Ví dụ: Sạc 1 phút (60s) nhưng minimum là 30 phút (1800s)
-        // → billablePowerConsumed = actualPowerConsumed × (1800 / 60) = actualPowerConsumed × 30
+
+        // Nếu < 30 phút → scale up để tính như 30 phút
+        // Avoid division by zero
+        long safeActualMinutes = Math.max(1L, actualMinutes);
+
         BigDecimal billablePowerConsumed = actualPowerConsumed
-                .multiply(BigDecimal.valueOf(minimumSeconds))
-                .divide(BigDecimal.valueOf(actualSeconds), 3, RoundingMode.HALF_UP);
+                .multiply(BigDecimal.valueOf(MINIMUM_CHARGING_TIME_MINUTES))
+                .divide(BigDecimal.valueOf(safeActualMinutes), 3, RoundingMode.HALF_UP);
+
+        log.info("Session {} sạc {} phút < {} phút minimum. Actual power: {} kWh, Billable power: {} kWh (×{})",
+                 session.getSessionId(), actualMinutes, MINIMUM_CHARGING_TIME_MINUTES,
+                 actualPowerConsumed, billablePowerConsumed,
+                 String.format("%.2f", (double) MINIMUM_CHARGING_TIME_MINUTES / safeActualMinutes));
+
         return billablePowerConsumed;
     }
 
@@ -252,7 +304,10 @@ public class PaymentServiceImpl implements PaymentService {
         Session session = sessionRepository.findById(request.getSessionId())
                 .orElseThrow(() -> new RuntimeException("Không tìm thấy phien sạc"));
 
-        if (session.getStatus() != Session.SessionStatus.COMPLETED) {
+        // Cho phép thanh toán khi session status = COMPLETED hoặc PARKING
+        // PARKING status nghĩa là đã hoàn thành sạc và đang đỗ xe, user có thể thanh toán
+        if (session.getStatus() != Session.SessionStatus.COMPLETED && 
+            session.getStatus() != Session.SessionStatus.PARKING) {
             throw new RuntimeException("Phiên sạc chưa hoàn thành, không thể thanh toán");
         }
 
@@ -513,6 +568,33 @@ public class PaymentServiceImpl implements PaymentService {
             fee.setIsPaid(true);
             feeRepository.save(fee);
         });
+
+        // ============ CHUYỂN SESSION TỪ PARKING SANG COMPLETED SAU KHI THANH TOÁN THÀNH CÔNG ============
+        Session session = transaction.getSession();
+        if (session != null && session.getStatus() == Session.SessionStatus.PARKING) {
+            log.info("Chuyển session {} từ PARKING sang COMPLETED sau khi thanh toán thành công", session.getSessionId());
+            
+            // Chuyển session status sang COMPLETED
+            session.setStatus(Session.SessionStatus.COMPLETED);
+            sessionRepository.save(session);
+            
+            // Update order status (nếu chưa COMPLETED)
+            Order order = session.getOrder();
+            if (order != null && order.getStatus() != Order.Status.COMPLETED) {
+                order.setStatus(Order.Status.COMPLETED);
+                orderRepository.save(order);
+            }
+            
+            // Update charging point status to AVAILABLE (giải phóng charging point)
+            if (order != null) {
+                ChargingPoint chargingPoint = order.getChargingPoint();
+                if (chargingPoint != null) {
+                    chargingPoint.setStatus(ChargingPoint.ChargingPointStatus.AVAILABLE);
+                    chargingPointRepository.save(chargingPoint);
+                    log.info("Charging point {} đã được giải phóng (status: AVAILABLE)", chargingPoint.getChargingPointId());
+                }
+            }
+        }
 
         // ============ TỰ ĐỘNG MỞ KHÓA TÀI KHOẢN ============
         Long userId = transaction.getUser().getUserId();

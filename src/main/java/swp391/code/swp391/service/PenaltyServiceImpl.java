@@ -179,54 +179,16 @@ public class PenaltyServiceImpl implements PenaltyService {
         }
     }
 
+    /**
+     * @deprecated Overtime charging replaced by parking fee system
+     * Use parking fees calculated in endSession() instead
+     */
+    @Deprecated
     @Override
-    @Transactional(rollbackFor = Exception.class) // AC8: Rollback nếu lỗi
+    @Transactional(rollbackFor = Exception.class)
     public Fee handleOvertimeCharging(Long sessionId, int extraMinutes) {
-        log.info("AC3: Processing overtime charging for session {}, extra minutes: {}",
-                sessionId, extraMinutes);
-
-        try {
-            Session session = sessionRepository.findById(sessionId)
-                    .orElseThrow(() -> new ApiRequestException("Session không tồn tại"));
-
-            if (extraMinutes <= 0) {
-                log.warn("Extra minutes is 0 or negative, skipping");
-                return null;
-            }
-
-            // Tạo fee overtime (2,000 VNĐ/phút)
-            Fee overtimeFee = feeCalculationService.calculateChargingFee(session, extraMinutes);
-            log.info("Created OVERTIME fee: {} VNĐ for session {}", overtimeFee.getAmount(), sessionId);
-
-            // Cập nhật session status
-            if (session.getStatus() != Session.SessionStatus.OVERTIME) {
-                session.setStatus(Session.SessionStatus.OVERTIME);
-                sessionRepository.save(session);
-            }
-
-            // Gửi notification real-time
-            Long userId = session.getOrder().getUser().getUserId();
-            // TODO: Send notification to user
-//            Long userId = session.getOrder().getUser().getUserId();
-//                    List.of(userId),
-//                    "Phí sạc quá giờ",
-//                    String.format("Pin đã đầy nhưng xe vẫn kết nối. " +
-//                            "Bạn đang bị tính phí 2,000 VNĐ/phút. " +
-//                            "Tổng phí hiện tại: %,.0f VNĐ (%d phút).",
-//                            overtimeFee.getAmount(), extraMinutes)
-//            );
-
-            // TODO: Gửi qua WebSocket để cập nhật real-time
-            // webSocketService.sendToUser(userId, "overtime-fee", overtimeFee);
-
-            return overtimeFee;
-
-        } catch (ApiRequestException e) {
-            throw e;
-        } catch (Exception e) {
-            log.error("Error in handleOvertimeCharging: {}", e.getMessage(), e);
-            throw new RuntimeException("Lỗi hệ thống khi xử lý phí overtime: " + e.getMessage());
-        }
+        log.warn("DEPRECATED: handleOvertimeCharging is no longer used. Parking fees are handled in endSession()");
+        throw new UnsupportedOperationException("Overtime charging is deprecated. Use parking fee system instead.");
     }
 
     @Override

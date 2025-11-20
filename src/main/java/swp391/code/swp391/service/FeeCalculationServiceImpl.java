@@ -26,30 +26,15 @@ public class FeeCalculationServiceImpl implements FeeCalculationService {
     private static final BigDecimal NO_SHOW_RATE = new BigDecimal("0.30"); // 30%
     private static final BigDecimal CANCEL_RATE = new BigDecimal("0.10"); // 10%
 
+    /**
+     * @deprecated Replaced by parking fee calculation in SessionServiceImpl.endSession()
+     */
+    @Deprecated
     @Override
     @Transactional
     public Fee calculateChargingFee(Session session, int extraMinutes) {
-        log.info("Đang tính phí CHARGING cho session: {}, số phút thêm: {}",
-                session.getSessionId(), extraMinutes);
-
-        if (extraMinutes <= 0) {
-            return null;
-        }
-
-        BigDecimal amount = OVERCHARGE_RATE.multiply(new BigDecimal(extraMinutes));
-
-        Fee fee = new Fee();
-        fee.setSession(session);
-        fee.setType(Fee.Type.OVERTIME); // AC3: OVERTIME type
-        fee.setAmount(amount.doubleValue()); // Convert to Double for existing entity
-        fee.setDescription(String.format(
-                "Phí sạc quá giờ: %d phút × %s VNĐ/phút",
-                extraMinutes, OVERCHARGE_RATE.toString()
-        ));
-        fee.setIsPaid(false);
-        fee.setCreatedAt(LocalDateTime.now());
-
-        return feeRepository.save(fee);
+        log.warn("DEPRECATED: calculateChargingFee is replaced by parking fee calculation");
+        throw new UnsupportedOperationException("Charging fee calculation is deprecated. Use parking fee instead.");
     }
 
     @Override
@@ -154,5 +139,46 @@ public class FeeCalculationServiceImpl implements FeeCalculationService {
         return estimatedPower.multiply(basePrice)
                 .multiply(new BigDecimal("1.2"))
                 .setScale(2, RoundingMode.HALF_UP);
+    }
+
+    @Override
+    public double calculateParkingFee(long parkedMinutes) {
+        if (parkedMinutes <= 0) {
+            return 0.0;
+        }
+
+        double baseRatePerMinute = 500.0; // 500 VND/phút
+        double hours = Math.floor(parkedMinutes / 60.0);
+        double multiplier = 1.0 + (0.5 * hours); // +50% mỗi giờ
+        double amount = baseRatePerMinute * parkedMinutes * multiplier;
+
+        double minimum = 10000.0; // Phí tối thiểu 10,000 VND
+        return Math.max(amount, minimum);
+    }
+
+    @Override
+    @Transactional
+    public Fee createParkingFee(Session session, long chargeableMinutes) {
+        if (chargeableMinutes <= 0) {
+            log.info("Không tạo parking fee - chargeableMinutes <= 0");
+            return null;
+        }
+
+        double amount = calculateParkingFee(chargeableMinutes);
+
+        Fee fee = new Fee();
+        fee.setOrder(session.getOrder());
+        fee.setSession(session);
+        fee.setType(Fee.Type.PARKING);
+        fee.setAmount(amount);
+        fee.setIsPaid(false);
+        fee.setCreatedAt(LocalDateTime.now());
+        fee.setDescription(String.format("Phí đỗ xe %d phút (sau grace period 15 phút)", chargeableMinutes));
+
+        Fee savedFee = feeRepository.save(fee);
+        log.info("Created parking fee: {} VND for session {} ({} minutes)",
+                 amount, session.getSessionId(), chargeableMinutes);
+
+        return savedFee;
     }
 }

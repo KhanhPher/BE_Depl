@@ -406,7 +406,9 @@ public class OrderServiceImpl implements OrderService {
         }
 
         // ===== 3. KIỂM TRA GIỚI HẠN ĐƠN ĐẶT CHỖ =====
-        int currentActiveOrder = orderRepository.countActiveOrdersByUser(user);
+        // Chỉ đếm orders có status BOOKED hoặc CHARGING và endTime > currentTime (upcoming)
+        LocalDateTime now = LocalDateTime.now();
+        int currentActiveOrder = orderRepository.countActiveOrdersByUser(user.getUserId(), now);
         if (!subscriptionService.canCreateMoreOrder(user.getUserId(), currentActiveOrder)) {
             throw new ApiRequestException("Bạn đã đạt giới hạn đơn đặt chỗ hiện tại. " +
                     "Nâng cấp lên gói PLUS hoặc PRO để được đặt nhiều hơn!");
@@ -418,6 +420,23 @@ public class OrderServiceImpl implements OrderService {
 
         if (!vehicle.getUser().getUserId().equals(user.getUserId())) {
             throw new ApiRequestException("Xe này không thuộc về bạn");
+        }
+
+        // ===== 4.1. VALIDATE BATTERY LEVELS =====
+        if (request.getTargetBattery() <= request.getCurrentBattery()) {
+            throw new ApiRequestException(
+                String.format("Mức pin mong muốn (%.1f%%) phải lớn hơn mức pin hiện tại (%.1f%%)",
+                              request.getTargetBattery(),
+                              request.getCurrentBattery())
+            );
+        }
+
+        if (request.getCurrentBattery() < 0 || request.getCurrentBattery() > 100) {
+            throw new ApiRequestException("Mức pin hiện tại phải trong khoảng 0-100%");
+        }
+
+        if (request.getTargetBattery() < 0 || request.getTargetBattery() > 100) {
+            throw new ApiRequestException("Mức pin mong muốn phải trong khoảng 0-100%");
         }
 
         // ===== 5. VALIDATE STATION =====
@@ -436,8 +455,8 @@ public class OrderServiceImpl implements OrderService {
             throw new ApiRequestException("Điểm sạc không khả dụng");
         }
 
-        LocalDateTime now = LocalDateTime.now();
-        boolean isBookNow = !request.getStartTime().isAfter(now.plusMinutes(IMMEDIATE_START_THRESHOLD_MINUTES));
+
+        boolean isBookNow = !request.getStartTime().isAfter(LocalDateTime.now().plusMinutes(IMMEDIATE_START_THRESHOLD_MINUTES));
 
         // ===== 6.1. BOOK NOW: TÍNH THỜI GIAN KẾT THÚC THỰC TẾ =====
         LocalDateTime actualEndTime = request.getEndTime();
@@ -930,6 +949,15 @@ public class OrderServiceImpl implements OrderService {
             }
         }
 
+        // Lấy session info nếu có
+        Session session = sessionRepository.findByOrderOrderId(order.getOrderId());
+        String sessionStatus = null;
+        Long sessionId = null;
+        if (session != null) {
+            sessionStatus = session.getStatus() != null ? session.getStatus().name() : null;
+            sessionId = session.getSessionId();
+        }
+
         return OrderResponseDTO.builder()
                 .orderId(order.getOrderId())
 
@@ -974,6 +1002,8 @@ public class OrderServiceImpl implements OrderService {
                 .energyToCharge(energyToCharge)
                 .estimatedCost(estimatedCost)
                 .status(order.getStatus() != null ? order.getStatus().name() : null)
+                .sessionStatus(sessionStatus)
+                .sessionId(sessionId)
                 .createdAt(order.getCreatedAt())
                 .build();
     }
