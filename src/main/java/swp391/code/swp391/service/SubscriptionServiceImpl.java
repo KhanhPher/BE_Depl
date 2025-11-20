@@ -2,6 +2,7 @@ package swp391.code.swp391.service;
 
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 import swp391.code.swp391.dto.SubscriptionRequestDTO;
 import swp391.code.swp391.dto.SubscriptionResponseDTO;
 import swp391.code.swp391.dto.UserDTO;
@@ -31,11 +32,12 @@ public class SubscriptionServiceImpl implements SubscriptionService {
     private SubscriptionFeatureRepository subscriptionFeatureRepository;
 
     @Override
+    @Transactional(readOnly = true)
     public List<SubscriptionResponseDTO> getAllSubscriptions() {
         return subscriptionRepository.findAll().stream()
                 .map(this::convertToDTO)
-                .toList();
-
+                .filter(dto -> dto != null) // Filter null DTOs
+                .collect(Collectors.toList());
     }
 
     @Override
@@ -275,6 +277,10 @@ public class SubscriptionServiceImpl implements SubscriptionService {
     }
 
     public SubscriptionResponseDTO convertToDTO(Subscription subscription) {
+        if (subscription == null) {
+            return null;
+        }
+        
         SubscriptionResponseDTO dto = new SubscriptionResponseDTO();
         dto.setSubscriptionId(subscription.getSubscriptionId());
         dto.setType(subscription.getType());
@@ -304,18 +310,31 @@ public class SubscriptionServiceImpl implements SubscriptionService {
         if (subscription.getDisplayOrder() != null) {
             dto.setDisplayOrder(subscription.getDisplayOrder());
         }
-        // Map users to UserDTO list (null-safe)
-        if (subscription.getUser() != null) {
-            dto.setUserId(subscription.getUser().stream()
-                    .map(user -> new UserDTO(user, false))
-                    .collect(Collectors.toList()));
-        } else {
+        // Map users to UserDTO list (null-safe với xử lý lazy loading)
+        try {
+            List<User> users = subscription.getUser();
+            if (users != null && !users.isEmpty()) {
+                dto.setUserId(users.stream()
+                        .filter(user -> user != null) // Filter null users
+                        .map(user -> {
+                            try {
+                                return new UserDTO(user, false);
+                            } catch (Exception e) {
+                                // Log error và skip user này
+                                return null;
+                            }
+                        })
+                        .filter(dtoUser -> dtoUser != null) // Filter null DTOs
+                        .collect(Collectors.toList()));
+            } else {
+                dto.setUserId(Collections.emptyList());
+            }
+        } catch (Exception e) {
+            // Nếu gặp LazyInitializationException hoặc lỗi khác, set empty list
             dto.setUserId(Collections.emptyList());
         }
 
         return dto;
-
-
     }
 
     /**
