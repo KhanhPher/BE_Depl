@@ -50,7 +50,8 @@ public class SecurityConfig {
     public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
         http
                 .csrf(AbstractHttpConfigurer::disable)
-                .cors(Customizer.withDefaults())
+                //.cors(Customizer.withDefaults())
+                .cors(cors -> cors.configurationSource(corsConfigurationSource()))
                 .addFilterBefore(jwtBlacklistFilter, BearerTokenAuthenticationFilter.class)
                 .addFilterAfter(userStatusFilter, BearerTokenAuthenticationFilter.class)
                 .addFilterAfter(authorizeationFilter, BearerTokenAuthenticationFilter.class)
