@@ -883,9 +883,10 @@ public class OrderServiceImpl implements OrderService {
                     return status == Order.Status.BOOKED || status == Order.Status.CHARGING;
                 })
                 .map(this::convertToDTO)
+                .filter(dto -> dto != null) // Filter out null DTOs
                 .collect(Collectors.toList());
 
-        return orderDTOs.isEmpty() ? null : orderDTOs;
+        return orderDTOs; // Trả về empty list thay vì null để tránh NullPointerException
     }
 
     private AvailableSlotsResponseDTO.VehicleInfo buildVehicleInfo(Vehicle vehicle) {
@@ -905,12 +906,29 @@ public class OrderServiceImpl implements OrderService {
     public OrderResponseDTO convertToDTO(Order order) {
         if (order == null) return null;
 
-        int estimatedDuration = calculateChargingDuration(
-                (order.getExpectedBattery() - order.getStartedBattery()) / 100.0 * order.getVehicle().getCarModel().getCapacity(),
-                order.getChargingPoint().getConnectorType().getPowerOutput());
+        // Null-safe calculation for estimatedDuration
+        int estimatedDuration = 0;
+        if (order.getVehicle() != null && 
+            order.getVehicle().getCarModel() != null && 
+            order.getChargingPoint() != null && 
+            order.getChargingPoint().getConnectorType() != null) {
+            double batteryDiff = (order.getExpectedBattery() - order.getStartedBattery()) / 100.0;
+            double capacity = order.getVehicle().getCarModel().getCapacity();
+            double powerOutput = order.getChargingPoint().getConnectorType().getPowerOutput();
+            estimatedDuration = calculateChargingDuration(batteryDiff * capacity, powerOutput);
+        }
 
         double energyToCharge = order.getExpectedBattery() - order.getStartedBattery();
-        double estimatedCost = energyToCharge * order.getChargingPoint().getConnectorType().getPricePerKWh();
+        
+        // Null-safe calculation for estimatedCost
+        double estimatedCost = 0.0;
+        if (order.getChargingPoint() != null && 
+            order.getChargingPoint().getConnectorType() != null) {
+            Double pricePerKWh = order.getChargingPoint().getConnectorType().getPricePerKWh();
+            if (pricePerKWh != null) {
+                estimatedCost = energyToCharge * pricePerKWh;
+            }
+        }
 
         return OrderResponseDTO.builder()
                 .orderId(order.getOrderId())
