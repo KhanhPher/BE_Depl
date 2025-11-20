@@ -27,6 +27,11 @@ public class AuthorizationFilter extends OncePerRequestFilter {
 
     @Override
     protected boolean shouldNotFilter(HttpServletRequest request) {
+        // Skip OPTIONS requests (CORS preflight) - không cần authentication
+        if ("OPTIONS".equalsIgnoreCase(request.getMethod())) {
+            return true;
+        }
+        
         AntPathMatcher pathMatcher = new AntPathMatcher();
         String path = request.getRequestURI();
         return Arrays.stream(SecurityConstants.PUBLIC_ENDPOINTS_EXCLUDED).anyMatch(pattern -> pathMatcher.match(pattern, path));
